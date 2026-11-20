@@ -1,25 +1,43 @@
 --[[
-    GPBHub_Export_Stats.lua v2 - companion exporter for GPBHub_Stats_Dashboard.html
+    GPBHub_Export_Stats.lua v3 - companion exporter for gpbhub-account-stats.html
     --------------------------------------------------------------------------------
     Compatible with GPBHub / Generic Hub 2026-11-16_v4 (and still works on v3).
 
     Run with your executor while you are in the game. It will:
       1. Find the game's ECS world + your player entity (same technique the hub uses).
-      2. Read your account data: Coins, Molten Obsidian, Stardust, PlayerLevel/Class,
-         Fishing (stash/bait/charms/rods), Rings, Potions, EquippedCharm/Weapon/Armor,
-         Item/Weapon/Armor entities with the hub's exact v4 gear score (skills +
-         passives weighted DPS), Mythical forge progress, relics, equipped title, etc.
-      3. Save GPBHub/stats.json, and LIVE-PUSH the JSON to your stats server.
+      2. Read your account data: Coins, Molten Obsidian, Stardust, Wishes,
+         PlayerLevel/Class, Fishing (stash/bait/charms/rods), Rings, Potions,
+         EquippedCharm/Weapon/Armor, Item/Weapon/Armor entities with the hub's
+         exact v4 gear score (skills + passives weighted DPS), Mythical forge
+         progress, relics, equipped title, etc.
+      3. Track this session: coins earned, wishes earned and an average
+         coins/hour rate (only increases count, so spending is never counted
+         as negative farming). State survives reloads via
+         GPBHub/data/session_<userId>.json and resets after a 30-min gap.
+      4. Save GPBHub/stats.json, and LIVE-PUSH the JSON to your stats server.
+      5. Survive lobby changes: arms queue_on_teleport so the script re-runs
+         itself automatically after every teleport/server hop (session totals
+         carry over - they only reset after a 30-min gap).
 
     Live tracking:
-      - Start the included GPBHub_Live_Server.js  (node GPBHub_Live_Server.js)
-      - This script posts to it every few seconds automatically.
-      - Open http://127.0.0.1:8787/ in a browser -> dashboard with LIVE updates.
+      - Default: posts straight to the hosted dashboard server
+        https://gpbhub.onrender.com/report  -> open https://gpbhub.onrender.com/
+        in a browser for the LIVE dashboard (no local server needed).
+        NOTE: Render's free tier sleeps after ~15 min idle; the FIRST push
+        after a sleep can take up to ~60s while the server wakes up. The
+        push loop retries automatically - just give it a minute.
+      - Or run the included GPBHub_Live_Server.js locally
+        (node GPBHub_Live_Server.js, dashboard at http://127.0.0.1:8787/).
 
     Config (set on getgenv() before/while running):
-      getgenv().GPBHubStatsUrl      = "http://127.0.0.1:8787/report"
+      getgenv().GPBHubStatsUrl      = "https://gpbhub.onrender.com/report"
+                                    -- (a bare base like "https://gpbhub.onrender.com"
+                                    --  also works: /report is appended automatically)
       getgenv().GPBHubStatsInterval = 5        -- seconds between pushes (min 2)
       getgenv().GPBHubStatsToken    = ""       -- bearer token, if the server uses one
+      getgenv().GPBHubStatsAutoReload = true   -- re-run automatically after lobby changes/teleports
+      getgenv().GPBHubStatsSelfUrl    = "https://raw.githubusercontent.com/Content-farmer/1/main/GPBHub_Export_Stats.lua"
+                                               -- where the auto-reloader re-downloads the script from
       getgenv().GPBHubStatsLive()             -- toggle live loop on/off
       getgenv().GPBHubExportStats()           -- one-shot export (also copies to clipboard)
 ]]
@@ -29,8 +47,26 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 
 -- ------------------------------------------------------------------ settings
-local DEFAULT_URL = "https://gpbhub.onrender.com/" 
+local DEFAULT_URL = "https://gpbhub.onrender.com/report"
+local DEFAULT_SELF_URL = "https://raw.githubusercontent.com/Content-farmer/1/main/GPBHub_Export_Stats.lua"
 local DEFAULT_INTERVAL = 5
+
+-- Accept a bare base ("https://gpbhub.onrender.com", "http://127.0.0.1:8787",
+-- with or without trailing slash) and always end up on the /report endpoint.
+local function normalizeUrl(u)
+        u = tostring(u or ""):gsub("%s+", "")
+        if u == "" then
+                return DEFAULT_URL
+        end
+        if not (u:match("^https?://")) then
+                u = "https://" .. u
+        end
+        u = u:gsub("/+$", "") -- strip trailing slashes
+        if not u:match("/report$") then
+                u = u .. "/report"
+        end
+        return u
+end
 
 local function liveCfg()
         local g = (type(getgenv) == "function" and getgenv()) or {}
@@ -38,7 +74,7 @@ local function liveCfg()
         if interval < 2 then
                 interval = 2
         end
-        return tostring(g.GPBHubStatsUrl or DEFAULT_URL), interval, tostring(g.GPBHubStatsToken or "")
+        return normalizeUrl(g.GPBHubStatsUrl or DEFAULT_URL), interval, tostring(g.GPBHubStatsToken or "")
 end
 
 -- ------------------------------------------------------------------- helpers
@@ -594,6 +630,111 @@ local function rawComp(c, depth)
         return jsonSafe(v, depth or 2)
 end
 
+-- scalar components (Coins / MoltenObsidian / Wishes) are tables with a
+-- .value field; tolerate a bare number too, in case the game changes
+local function scalarComp(c)
+        local v = get(c)
+        if type(v) == "table" then
+                return num(v.value)
+        end
+        return num(v)
+end
+
+-- ------------------------------------------------------- session tracking
+-- Feeds the dashboard's "coins/hr" line and the "+N wishes this session"
+-- counter on the wishes card. Mirrors the hub's own session counters:
+-- only increases are accumulated (spending / deaths / resets never count
+-- as negative earnings), and the session resets after a 30-minute gap.
+local SESSION_GAP = 1800
+local sessionCache = nil
+
+local function hasFs()
+        return type(writefile) == "function" and type(readfile) == "function"
+                and type(isfolder) == "function" and type(makefolder) == "function"
+end
+
+local function sessionPath(uid)
+        return "GPBHub/data/session_" .. tostring(uid) .. ".json"
+end
+
+local function loadSession(uid)
+        if sessionCache then
+                return sessionCache
+        end
+        if hasFs() then
+                local okR, txt = pcall(readfile, sessionPath(uid))
+                if okR and type(txt) == "string" and #txt > 0 then
+                        local okJ, data = pcall(function()
+                                return HttpService:JSONDecode(txt)
+                        end)
+                        if okJ and type(data) == "table" then
+                                sessionCache = data
+                        end
+                end
+        end
+        return sessionCache
+end
+
+local function saveSession(uid, s)
+        sessionCache = s
+        if hasFs() then
+                pcall(function()
+                        if not isfolder("GPBHub") then
+                                makefolder("GPBHub")
+                        end
+                        if not isfolder("GPBHub/data") then
+                                makefolder("GPBHub/data")
+                        end
+                        writefile(sessionPath(uid), HttpService:JSONEncode(s))
+                end)
+        end
+end
+
+local function updateSession(uid, coins, wishes)
+        local now = os.time()
+        local s = loadSession(uid)
+        if
+                type(s) ~= "table"
+                or not valid(s.startedAt)
+                or not valid(s.seenAt)
+                or now - s.seenAt > SESSION_GAP
+                or now < s.startedAt
+        then
+                s = {
+                        startedAt = now,
+                        seenAt = now,
+                        coinsEarned = 0,
+                        wishesEarned = 0,
+                        lastCoins = coins,
+                        lastWishes = wishes,
+                }
+        end
+        if valid(coins) and valid(s.lastCoins) and coins > s.lastCoins then
+                s.coinsEarned = (s.coinsEarned or 0) + (coins - s.lastCoins)
+        end
+        if valid(wishes) and valid(s.lastWishes) and wishes > s.lastWishes then
+                s.wishesEarned = (s.wishesEarned or 0) + (wishes - s.lastWishes)
+        end
+        s.lastCoins = valid(coins) and coins or s.lastCoins
+        s.lastWishes = valid(wishes) and wishes or s.lastWishes
+        s.seenAt = now
+        s.secondsActive = now - s.startedAt
+        saveSession(uid, s)
+
+        local coinsPerHour = nil
+        local hours = s.secondsActive / 3600
+        if s.secondsActive >= 60 and hours > 0 and (s.coinsEarned or 0) > 0 then
+                coinsPerHour = math.floor(s.coinsEarned / hours + 0.5)
+        end
+        return {
+                startedAt = os.date("!%Y-%m-%dT%H:%M:%SZ", s.startedAt),
+                secondsActive = s.secondsActive,
+                coinsEarned = s.coinsEarned,
+                coinsPerHour = coinsPerHour,
+                wishesEarned = s.wishesEarned,
+        }
+end
+
 -- ---------------------------------------------------------------- myth meta
 local MYTH_ITEMS = { "InkGauntlets", "DragonSpear", "Volt", "Valor", "Elk" }
 local MYTH_ARMOR = { Valor = true, Elk = true }
@@ -1032,8 +1173,10 @@ local function buildStats()
                 end
         end
 
-        local coinsComp = get(comps.Coins)
-        local obsidianComp = get(comps.MoltenObsidian)
+        local coinsValue = scalarComp(comps.Coins)
+        local obsidianValue = scalarComp(comps.MoltenObsidian)
+        local wishesValue = scalarComp(comps.Wishes)
+        local sessionOut = updateSession(LP.UserId, coinsValue, wishesValue)
 
         local stats = {
                 schema = "gpbhub-stats/1",
@@ -1062,10 +1205,12 @@ local function buildStats()
                         title = titleOut,
                 },
                 currencies = {
-                        coins = type(coinsComp) == "table" and num(coinsComp.value) or nil,
+                        coins = coinsValue,
                         stardust = ringsOut.stardust,
-                        moltenObsidian = type(obsidianComp) == "table" and num(obsidianComp.value) or nil,
+                        moltenObsidian = obsidianValue,
                 },
+                wishes = { total = wishesValue },
+                session = sessionOut,
                 gear = { bestWeapon = bestWeapon, bestArmor = bestArmor },
                 items = { weapons = weapons, armor = armor },
                 equipped = { charm = rawComp(comps.EquippedCharm, 3) },
@@ -1079,7 +1224,6 @@ local function buildStats()
                         loot = rawComp(comps.Loot, 3),
                         gamepasses = rawComp(comps.Gamepasses, 3),
                         claimedCodes = rawComp(comps.ClaimedCodes, 3),
-                        wishes = rawComp(comps.Wishes, 3),
                         banners = rawComp(comps.Banners, 3),
                         armoryState = rawComp(comps.ArmoryState, 3),
                 },
@@ -1106,21 +1250,46 @@ local function pushStats(encoded)
         if token ~= "" then
                 headers["Authorization"] = "Bearer " .. token
         end
-        local ok, res = pcall(httpFn, { Url = url, Method = "POST", Headers = headers, Body = encoded })
-        if not ok then
-                return false, res
+
+        -- Render free tier sleeps after ~15 min idle: the first request can
+        -- take up to ~60s while the server wakes up. Retry a few times so a
+        -- cold start (or a hiccup) never silently kills the live feed.
+        local lastErr = nil
+        for attempt = 1, 3 do
+                if attempt > 1 then
+                        task.wait(5)
+                end
+                local ok, res = pcall(httpFn, { Url = url, Method = "POST", Headers = headers, Body = encoded })
+                if not ok then
+                        lastErr = res
+                elseif type(res) == "table" and valid(res.StatusCode) and (res.StatusCode < 200 or res.StatusCode > 299) then
+                        if res.StatusCode == 405 then
+                                lastErr = "HTTP 405 (wrong endpoint - url should end in /report)"
+                        elseif res.StatusCode == 404 then
+                                lastErr = "HTTP 404 (wrong endpoint - url should end in /report)"
+                        else
+                                lastErr = "HTTP " .. tostring(res.StatusCode)
+                        end
+                else
+                        return true
+                end
         end
-        if type(res) == "table" and valid(res.StatusCode) and (res.StatusCode < 200 or res.StatusCode > 299) then
-                return false, "HTTP " .. tostring(res.StatusCode)
-        end
-        return true
+        return false, lastErr
 end
+
+local worldFailCount = 0
 
 local function sendOnce(withClipboard)
         if not ensureWorld() then
-                notify("Could not find the ECS world. Join the game first, then run this again.")
+                -- don't spam notifications while the world/entity is still
+                -- spawning (e.g. right after a lobby change)
+                worldFailCount = worldFailCount + 1
+                if worldFailCount <= 2 or worldFailCount % 12 == 0 then
+                        notify("Could not find the ECS world. Join the game first, then run this again.")
+                end
                 return false
         end
+        worldFailCount = 0
         local okB, stats = pcall(buildStats)
         if not okB or type(stats) ~= "table" then
                 notify("Collecting stats failed: " .. tostring(stats))
@@ -1179,9 +1348,13 @@ local function sendOnce(withClipboard)
 
         print(
                 string.format(
-                        "[GPBHub Export] %s | coins %s | obsidian %s | weapons %d | armor %d | rings %d | charms %d | myth forged %d/%d",
+                        "[GPBHub Export] %s | coins %s (+%s this session, ~%s/hr) | wishes %s (+%s) | obsidian %s | weapons %d | armor %d | rings %d | charms %d | myth forged %d/%d",
                         stats.exportedAt or "?",
                         tostring(stats.currencies.coins or "?"),
+                        tostring(stats.session.coinsEarned or 0),
+                        tostring(stats.session.coinsPerHour or "..."),
+                        tostring(stats.wishes.total or "?"),
+                        tostring(stats.session.wishesEarned or 0),
                         tostring(stats.currencies.moltenObsidian or "0"),
                         #(stats.items.weapons or {}),
                         #(stats.items.armor or {}),
@@ -1207,6 +1380,20 @@ end
 
 -- ------------------------------------------------------------------- live loop
 local liveOn = false
+
+-- If an older instance of this script is still running in this executor
+-- session (auto-exec + manual run, or a double load), stop its push loop
+-- first so pushes never double up.
+pcall(function()
+        local oldStop = getgenv().GPBHubStatsStopLive
+        if type(oldStop) == "function" then
+                oldStop()
+        end
+end)
+getgenv().GPBHubStatsStopLive = function()
+        liveOn = false
+end
+getgenv().GPBHubStatsInstances = (tonumber(getgenv().GPBHubStatsInstances) or 0) + 1
 
 getgenv().GPBHubExportStats = function()
         local ok = sendOnce(true)
@@ -1237,7 +1424,55 @@ getgenv().GPBHubStatsLive = function(on)
         return liveOn
 end
 
+-- --------------------------------------------------------------- auto reload
+-- Lobby changes / server hops destroy this script's context. Arm
+-- queue_on_teleport so the script re-runs itself automatically after every
+-- teleport; tracking then resumes on its own (session totals carry over via
+-- GPBHub/data/session_<userId>.json). Set getgenv().GPBHubStatsAutoReload =
+-- false before running to disable, or GPBHubStatsSelfUrl to change where the
+-- reload fetches the script from.
+local function armAutoReload()
+        local g = (type(getgenv) == "function" and getgenv()) or {}
+        if g.GPBHubStatsAutoReload == false then
+                return false
+        end
+        local selfUrl = tostring(g.GPBHubStatsSelfUrl or DEFAULT_SELF_URL)
+        local chunk = string.format('task.wait(3) loadstring(game:HttpGet(%q))()', selfUrl)
+
+        local queuers = {}
+        if type(queue_on_teleport) == "function" then
+                queuers[#queuers + 1] = queue_on_teleport
+        end
+        if type(queueonteleport) == "function" then
+                queuers[#queuers + 1] = queueonteleport
+        end
+        if type(g.queue_on_teleport) == "function" then
+                queuers[#queuers + 1] = g.queue_on_teleport
+        end
+        if type(g.queueonteleport) == "function" then
+                queuers[#queuers + 1] = g.queueonteleport
+        end
+        pcall(function()
+                if type(syn) == "table" and type(syn.queue_on_teleport) == "function" then
+                        queuers[#queuers + 1] = syn.queue_on_teleport
+                end
+        end)
+
+        for _, q in ipairs(queuers) do
+                local ok = pcall(q, chunk)
+                if ok then
+                        return true
+                end
+        end
+        return false
+end
+
 -- boot: one export now, then live tracking on by default
+local armed = armAutoReload()
 sendOnce(true)
-notify("Exported. Live tracking is starting - open the dashboard at your stats server.")
+notify("Exported (instance #" .. tostring(getgenv().GPBHubStatsInstances or 1) .. "). Live tracking on"
+        .. (armed and " - auto-restart armed for lobby changes." or " - auto-restart NOT supported by this executor."))
 getgenv().GPBHubStatsLive(true)
+if not armed then
+        warn("[GPBHub Export] queue_on_teleport not found - after a lobby change, re-run the script or enable your executor's auto-exec for this URL.")
+end
